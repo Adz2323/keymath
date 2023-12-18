@@ -15,6 +15,7 @@ gcc -o keymath keymath.c -lgmp
 #include <time.h>
 #include "util.h"
 #include "hashtable.h"
+#include <pthread.h>
 
 #include "gmpecc.h"
 #include "base58/libbase58.h"
@@ -253,12 +254,13 @@ int main(int argc, char **argv)
 		}
 
 		generate_strpublickey(&C, true, str_publickey);
-		gmp_fprintf(stdout, "%s # - %Zd\n\n", str_publickey, number);
+		gmp_fprintf(stdout, "\r%s # - %Zd", str_publickey, number);
+		fflush(stdout); // Ensure the output is updated immediately
 
 		if (checkPublicKey(publicKeysTable, str_publickey))
 		{
 			gmp_fprintf(matchedKeysFile, "%s # - %Zd\n", str_publickey, number);
-			printf("Matching key found: %s\n", str_publickey);
+			printf("\nMatching key found: %s\n", str_publickey);
 			break;
 		}
 
