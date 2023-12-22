@@ -1,5 +1,5 @@
 /*
-Developed by Luis Alberto
+Developed by Luis Alberto Updated by Adam
 email: alberto.bsd@gmail.com
 gcc -o keymath keymath.c -lgmp
 */
@@ -16,6 +16,7 @@ gcc -o keymath keymath.c -lgmp
 #include "util.h"
 #include "hashtable.h"
 #include <pthread.h>
+#include <signal.h>
 
 #include "gmpecc.h"
 #include "base58/libbase58.h"
@@ -25,6 +26,11 @@ gcc -o keymath keymath.c -lgmp
 struct Elliptic_Curve EC;
 struct Point G;
 struct Point DoublingG[256];
+struct publickey
+{
+	char *key; // Store the public key as a string
+};
+struct hashmap *publicKeysMap;
 
 const char *version = "0.1.211009";
 const char *EC_constant_N = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141";
@@ -35,18 +41,41 @@ const char *EC_constant_Gy = "483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c
 const char *formats[3] = {"publickey", "rmd160", "address"};
 const char *looks[2] = {"compress", "uncompress"};
 
+uint64_t publickey_hash(const void *item, uint64_t seed0, uint64_t seed1)
+{
+	const struct publickey *key = item;
+	return hashmap_sip(key->key, strlen(key->key), seed0, seed1);
+}
+
+int publickey_compare(const void *a, const void *b, void *udata)
+{
+	const struct publickey *ka = a;
+	const struct publickey *kb = b;
+	return strcmp(ka->key, kb->key);
+}
+
 void set_publickey(char *param, struct Point *publickey);
 void generate_strpublickey(struct Point *publickey, bool compress, char *dst);
 void Scalar_Multiplication_custom(struct Point P, struct Point *R, mpz_t m);
-void loadPublicKeysIntoHashTable(struct HashTable *table)
+void loadPublicKeysIntoHashTable(struct hashmap *publicKeysMap)
 {
 	FILE *file = fopen("publickeys.txt", "r");
-	char fileKey[256];
+	if (!file)
+	{
+		fprintf(stderr, "Error opening publickeys.txt\n");
+		return;
+	}
 
+	char fileKey[256];
 	while (fgets(fileKey, sizeof(fileKey), file))
 	{
-		fileKey[strcspn(fileKey, "\n")] = 0; // Remove newline
-		insert(table, fileKey);				 // Insert key into the hash table
+		fileKey[strcspn(fileKey, "\n")] = 0; // Remove newline character
+		char *dynamicKey = strdup(fileKey);	 // Duplicate the string
+		if (dynamicKey)
+		{
+			struct publickey newKey = {.key = dynamicKey};
+			hashmap_set(publicKeysMap, &newKey);
+		}
 	}
 
 	fclose(file);
@@ -66,22 +95,72 @@ int FLAG_NUMBER = 0;
 
 mpz_t inversemultiplier, number, increment, original_number, random_min, random_max;
 bool random_mode = false;
+gmp_randstate_t state;
 
 FILE *matchedKeysFile;
 
-bool checkPublicKey(struct HashTable *table, const char *generatedKey)
+bool checkPublicKey(struct hashmap *publicKeysMap, const char *generatedKey)
 {
-	return search(table, generatedKey);
+	struct publickey key = {.key = (char *)generatedKey};
+	return hashmap_get(publicKeysMap, &key) != NULL;
 }
 
 void generate_random_number(mpz_t result, mpz_t min, mpz_t max, gmp_randstate_t state)
 {
-	mpz_t range;
-	mpz_init(range);
+	// Check if min < max, if not, return an error or handle appropriately
+	if (mpz_cmp(min, max) >= 0)
+	{
+		// Handle error: min should be less than max
+		fprintf(stderr, "Error: min should be less than max in generate_random_number.\n");
+		return;
+	}
+
+	static mpz_t range;
+	static bool is_initialized = false;
+
+	// Initialize range only once
+	if (!is_initialized)
+	{
+		mpz_init(range);
+		is_initialized = true;
+	}
+
 	mpz_sub(range, max, min);			// range = max - min
 	mpz_urandomm(result, state, range); // Generate random number in [0, range)
 	mpz_add(result, result, min);		// Shift to [min, max)
+}
+
+// Remember to clear the static variable when it's no longer needed, e.g., at the end of your program
+void clear_random_number_generator()
+{
 	mpz_clear(range);
+}
+
+void handle_sigint(int sig)
+{
+	printf("Caught signal %d, cleaning up and exiting\n", sig);
+
+	// Clear mpz variables
+	mpz_clears(EC.p, EC.n, G.x, G.y, A.x, A.y, B.x, B.y, C.x, C.y, range, number, inversemultiplier, original_number, random_min, random_max, NULL);
+
+	// Close the matched keys file
+	if (matchedKeysFile != NULL)
+	{
+		fclose(matchedKeysFile);
+		matchedKeysFile = NULL;
+	}
+
+	// Clear the random state
+	gmp_randclear(state);
+
+	// Destroy the hash table
+	if (publicKeysMap != NULL)
+	{
+		hashmap_free(publicKeysMap);
+		publicKeysMap = NULL;
+	}
+
+	exit(0); // Exit program
 }
 
 int main(int argc, char **argv)
@@ -95,10 +174,18 @@ int main(int argc, char **argv)
 	gmp_randstate_t state;				// Declare the random state variable
 	gmp_randinit_default(state);		// Initialize the random state
 	gmp_randseed_ui(state, time(NULL)); // Seed the random state
+	signal(SIGINT, handle_sigint);
 
 	int hashTableSize = 35000000;
-	struct HashTable *publicKeysTable = createHashTable(hashTableSize);
-	loadPublicKeysIntoHashTable(publicKeysTable);
+	struct hashmap *publicKeysMap = hashmap_new(sizeof(struct publickey), 0, 0, 0, publickey_hash, publickey_compare, NULL, NULL);
+
+	if (!publicKeysMap)
+	{
+		fprintf(stderr, "Failed to create hashmap.\n");
+		return 1;
+	}
+
+	loadPublicKeysIntoHashTable(publicKeysMap);
 
 	FILE *matchedKeysFile = fopen("matched_keys.txt", "a");
 	if (matchedKeysFile == NULL)
@@ -257,7 +344,7 @@ int main(int argc, char **argv)
 		gmp_fprintf(stdout, "\r%s # - %Zd", str_publickey, number);
 		fflush(stdout); // Ensure the output is updated immediately
 
-		if (checkPublicKey(publicKeysTable, str_publickey))
+		if (checkPublicKey(publicKeysMap, str_publickey))
 		{
 			gmp_fprintf(matchedKeysFile, "%s # - %Zd\n", str_publickey, number);
 			printf("\nMatching key found: %s\n", str_publickey);
@@ -273,6 +360,7 @@ int main(int argc, char **argv)
 	mpz_clears(EC.p, EC.n, G.x, G.y, A.x, A.y, B.x, B.y, C.x, C.y, number, inversemultiplier, original_number, random_min, random_max, NULL);
 	fclose(matchedKeysFile);
 	gmp_randclear(state); // Clear the random state at the end
+	hashmap_free(publicKeysMap);
 	return 0;
 }
 
